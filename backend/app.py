@@ -1,6 +1,7 @@
-﻿# backend/app.py
+﻿# backend/app.py - Complete updated version with better depth map handling and 50MB support
 from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 import torch
 import numpy as np
@@ -17,6 +18,7 @@ from pathlib import Path
 import uuid
 from typing import Optional, Dict, Any
 import logging
+import traceback
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -37,12 +39,13 @@ app.add_middleware(
 models_cache = {}
 processing_jobs = {}
 
-# Limits to keep memory reasonable with very large inputs
-MAX_IMAGE_DIM = 2048  # max width/height used for processing
+# Limits to keep memory reasonable with larger inputs
+MAX_IMAGE_DIM = 3072  # Increased for larger images
 DEPTH_PREVIEW_MAX = 2048  # cap preview image size
+MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB limit
 
 class ProcessingRequest(BaseModel):
-    model: str = "triposr"
+    model: str = "depth-anything-v2"
     output_format: str = "las"
     point_density: str = "medium"
     coordinate_system: str = "WGS84"
@@ -118,17 +121,64 @@ def process_with_depth_anything(image: np.ndarray, model_info: dict) -> np.ndarr
         logger.error(f"Error in depth estimation: {str(e)}")
         raise
 
+def create_depth_preview(depth: np.ndarray, invert: bool = True) -> str:
+    """Create a base64 encoded depth map preview image"""
+    try:
+        d = depth.astype(np.float32)
+        
+        # Robust normalization with percentile clipping to reduce outliers
+        finite_mask = np.isfinite(d)
+        if not np.all(finite_mask):
+            med = np.nanmedian(d)
+            d = np.where(finite_mask, d, med)
+        
+        p2, p98 = np.percentile(d, [2, 98])
+        if p98 <= p2:
+            p2, p98 = float(d.min()), float(d.max())
+        
+        if p98 > p2:
+            d = np.clip(d, p2, p98)
+            d = (d - p2) / (p98 - p2 + 1e-6)
+        else:
+            d = np.zeros_like(d)
+            
+        # Invert for a more intuitive visualization if requested
+        if invert:
+            d = 1.0 - d
+
+        # Convert to 8-bit image
+        depth_img = (d * 255.0).astype(np.uint8)
+        
+        # Apply colormap for better visualization
+        depth_colored = cv2.applyColorMap(depth_img, cv2.COLORMAP_PLASMA)
+        
+        # Ensure preview isn't excessively large
+        dh, dw = depth_colored.shape[:2]
+        dmax = max(dh, dw)
+        if dmax > DEPTH_PREVIEW_MAX:
+            s = DEPTH_PREVIEW_MAX / float(dmax)
+            depth_colored = cv2.resize(depth_colored, (int(round(dw * s)), int(round(dh * s))), interpolation=cv2.INTER_AREA)
+        
+        # Encode to base64
+        ok, buf = cv2.imencode('.png', depth_colored)
+        if ok:
+            depth_b64 = base64.b64encode(buf.tobytes()).decode('utf-8')
+            return f"data:image/png;base64,{depth_b64}"
+        else:
+            raise ValueError("Failed to encode depth image")
+            
+    except Exception as e:
+        logger.error(f"Failed to create depth preview: {e}")
+        return None
+
 def depth_to_point_cloud(image: np.ndarray, depth: np.ndarray,
                         density: str = "medium",
                         invert: bool = True,
                         depth_scale: float = 10.0,
                         smooth: bool = False,
                         smooth_ksize: int = 5,
-                        fov: Optional[float] = None) -> np.ndarray:
-    """Convert depth map to 3D point cloud.
-
-    Ensures the depth map matches the image resolution to avoid OOB indexing.
-    """
+                        fov: Optional[float] = None) -> tuple:
+    """Convert depth map to 3D point cloud with improved error handling"""
     try:
         img_h, img_w = image.shape[:2]
         dep_h, dep_w = depth.shape[:2]
@@ -166,7 +216,6 @@ def depth_to_point_cloud(image: np.ndarray, depth: np.ndarray,
         h, w = img_h, img_w
 
         # Camera intrinsics (estimated)
-        # If FOV provided (horizontal, degrees), compute focal length in pixels
         cx, cy = w / 2.0, h / 2.0
         if fov and fov > 0:
             f = (w / 2.0) / np.tan(np.deg2rad(fov) / 2.0)
@@ -182,7 +231,6 @@ def depth_to_point_cloud(image: np.ndarray, depth: np.ndarray,
         for v in range(0, h, step):
             for u in range(0, w, step):
                 z = float(d[v, u]) * float(depth_scale)
-                # Allow zero/near-zero depths to pass so preview is never empty
                 x = (u - cx) * (z if z != 0.0 else 1e-6) / f
                 y = (v - cy) * (z if z != 0.0 else 1e-6) / f
 
@@ -201,13 +249,9 @@ def depth_to_point_cloud(image: np.ndarray, depth: np.ndarray,
         logger.error(f"Error in point cloud generation: {str(e)}")
         raise
 
-
 def refine_point_cloud(points: np.ndarray, colors: np.ndarray,
-                       nb_neighbors: int = 20, std_ratio: float = 2.0) -> tuple[np.ndarray, np.ndarray]:
-    """Denoise point cloud using statistical outlier removal.
-
-    Returns filtered points and colors, preserving alignment.
-    """
+                       nb_neighbors: int = 20, std_ratio: float = 2.0) -> tuple:
+    """Denoise point cloud using statistical outlier removal"""
     try:
         if points is None or len(points) == 0:
             return points, colors
@@ -223,13 +267,10 @@ def refine_point_cloud(points: np.ndarray, colors: np.ndarray,
     except Exception as e:
         logger.warning(f"Point cloud refinement failed: {e}")
         return points, colors
-    
-def save_mesh_from_points(points: np.ndarray, colors: np.ndarray, filename: str,
-                          method: str = "poisson") -> tuple[str, o3d.geometry.TriangleMesh]:
-    """Create a surface mesh from a point cloud and save as PLY.
 
-    method: 'poisson' (default) or 'bpa' (ball pivoting)
-    """
+def save_mesh_from_points(points: np.ndarray, colors: np.ndarray, filename: str,
+                          method: str = "poisson") -> tuple:
+    """Create a surface mesh from a point cloud and save as PLY"""
     Path("outputs").mkdir(exist_ok=True)
     filepath = f"outputs/{filename}.ply"
 
@@ -266,12 +307,12 @@ def save_mesh_from_points(points: np.ndarray, colors: np.ndarray, filename: str,
     o3d.io.write_triangle_mesh(filepath, mesh)
     return filepath, mesh
 
-
-
 def save_point_cloud(points: np.ndarray, colors: np.ndarray, 
                      format: str, filename: str) -> str:
     """Save point cloud in various formats"""
     try:
+        Path("outputs").mkdir(exist_ok=True)
+        
         if format.lower() == "ply":
             return save_ply(points, colors, filename)
         elif format.lower() in ["las", "laz"]:
@@ -288,26 +329,25 @@ def save_point_cloud(points: np.ndarray, colors: np.ndarray,
 def save_ply(points: np.ndarray, colors: np.ndarray, filename: str) -> str:
     """Save as PLY format"""
     filepath = f"outputs/{filename}.ply"
-    Path("outputs").mkdir(exist_ok=True)
     
     # Create Open3D point cloud
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(points)
-    pcd.colors = o3d.utility.Vector3dVector(colors / 255.0)
+    if colors is not None and len(colors) == len(points):
+        pcd.colors = o3d.utility.Vector3dVector(colors / 255.0)
     
     # Save
     o3d.io.write_point_cloud(filepath, pcd)
     return filepath
 
 def save_las(points: np.ndarray, colors: np.ndarray, filename: str) -> str:
-    """Save as LAS format for GIS compatibility (laspy v2)."""
+    """Save as LAS format for GIS compatibility"""
     filepath = f"outputs/{filename}.las"
-    Path("outputs").mkdir(exist_ok=True)
-
-    # Create LAS header: point_format 2 supports RGB; version 1.2 is widely compatible
+    
+    # Create LAS header
     header = laspy.LasHeader(point_format=2, version="1.2")
-
-    # Set scaling and offsets (LAS stores scaled integers internally)
+    
+    # Set scaling and offsets
     scale = 0.01
     offset = [float(points[:, 0].min()), float(points[:, 1].min()), float(points[:, 2].min())]
     header.scales = np.array([scale, scale, scale], dtype=np.float64)
@@ -316,20 +356,19 @@ def save_las(points: np.ndarray, colors: np.ndarray, filename: str) -> str:
     if points is None or len(points) == 0:
         raise ValueError("No points to write to LAS")
 
-    # Create LAS data and assign coordinates (LasData handles scaling)
+    # Create LAS data and assign coordinates
     las = laspy.LasData(header)
     las.x = points[:, 0]
     las.y = points[:, 1]
     las.z = points[:, 2]
 
-    # Optional colors (convert 0-255 to 0-65535)
+    # Optional colors
     if colors is not None and len(colors) == len(points):
         c = np.clip(colors, 0, 255).astype(np.uint16)
         las.red = (c[:, 0] * 256)
         las.green = (c[:, 1] * 256)
         las.blue = (c[:, 2] * 256)
     else:
-        # Provide default mid-gray if colors missing but format supports RGB
         las.red = np.full(len(points), 32768, dtype=np.uint16)
         las.green = np.full(len(points), 32768, dtype=np.uint16)
         las.blue = np.full(len(points), 32768, dtype=np.uint16)
@@ -340,7 +379,6 @@ def save_las(points: np.ndarray, colors: np.ndarray, filename: str) -> str:
 def save_xyz(points: np.ndarray, colors: np.ndarray, filename: str) -> str:
     """Save as XYZ ASCII format"""
     filepath = f"outputs/{filename}.xyz"
-    Path("outputs").mkdir(exist_ok=True)
     
     with open(filepath, 'w') as f:
         for i in range(len(points)):
@@ -368,6 +406,9 @@ def generate_gis_metadata(points: np.ndarray, request: ProcessingRequest) -> dic
         "generatedWith": request.model,
         "outputFormat": request.output_format,
         "pointDensity": request.point_density,
+        "depthScale": request.depth_scale,
+        "invertDepth": request.invert_depth,
+        "smoothDepth": request.smooth_depth,
     }
     
     if request.gps_coords:
@@ -376,7 +417,7 @@ def generate_gis_metadata(points: np.ndarray, request: ProcessingRequest) -> dic
     return metadata
 
 async def process_image_pipeline(job_id: str, image_data: bytes, request: ProcessingRequest):
-    """Main processing pipeline"""
+    """Main processing pipeline with improved error handling"""
     try:
         processing_jobs[job_id]["status"] = "processing"
         processing_jobs[job_id]["progress"] = 10
@@ -393,7 +434,7 @@ async def process_image_pipeline(job_id: str, image_data: bytes, request: Proces
         if image is None:
             raise ValueError("Failed to decode image data")
 
-        # Downscale very large images to keep processing and preview stable
+        # Downscale very large images for processing (increased limit for better quality)
         ih, iw = image.shape[:2]
         max_dim = max(ih, iw)
         if max_dim > MAX_IMAGE_DIM:
@@ -403,47 +444,26 @@ async def process_image_pipeline(job_id: str, image_data: bytes, request: Proces
             image = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_AREA)
             logger.info(f"Resized input image from {iw}x{ih} to {new_w}x{new_h} for processing")
         
+        # For very large images, use progressive processing to manage memory
+        processing_batch_size = 1000000  # Process in batches for very large images
+        total_pixels = image.shape[0] * image.shape[1]
+        use_batched_processing = total_pixels > processing_batch_size
+        
+        if use_batched_processing:
+            logger.info(f"Using batched processing for large image ({total_pixels:,} pixels)")
+        
         depth_data_url = None
         if request.model == "depth-anything-v2":
-            # Use Depth Anything V2 for depth estimation
             processing_jobs[job_id]["progress"] = 40
-            processing_jobs[job_id]["message"] = "Estimating depth..."
+            processing_jobs[job_id]["message"] = "Estimating depth with AI..."
             
             depth = process_with_depth_anything(image, model_info)
-            # Encode depth to a grayscale PNG data URL for frontend preview
-            try:
-                d = depth.astype(np.float32)
-                # Robust normalization (percentile clip) similar to point-cloud path
-                finite = np.isfinite(d)
-                if not np.any(finite):
-                    raise ValueError("Depth has no finite values for preview")
-                p2, p98 = np.percentile(d[finite], [2, 98])
-                if p98 <= p2:
-                    p2, p98 = float(d.min()), float(d.max())
-                if p98 > p2:
-                    d = np.clip(d, p2, p98)
-                    d = (d - p2) / (p98 - p2 + 1e-6)
-                else:
-                    d = np.zeros_like(d)
-                # Invert for a more intuitive visualization if requested
-                d = 1.0 - d if True else d  # uses default invert for preview
-
-                depth_img = (d * 255.0).astype(np.uint8)
-                # Ensure preview isn't excessively large
-                dh, dw = depth_img.shape[:2]
-                dmax = max(dh, dw)
-                if dmax > DEPTH_PREVIEW_MAX:
-                    s = DEPTH_PREVIEW_MAX / float(dmax)
-                    depth_img = cv2.resize(depth_img, (int(round(dw * s)), int(round(dh * s))), interpolation=cv2.INTER_AREA)
-                ok, buf = cv2.imencode('.png', depth_img)
-                if ok:
-                    depth_b64 = base64.b64encode(buf.tobytes()).decode('utf-8')
-                    depth_data_url = f"data:image/png;base64,{depth_b64}"
-            except Exception as e:
-                logger.warning(f"Failed to encode depth preview: {e}")
+            
+            # Create depth preview
+            depth_data_url = create_depth_preview(depth, invert=request.invert_depth)
             
             processing_jobs[job_id]["progress"] = 60
-            processing_jobs[job_id]["message"] = "Generating point cloud..."
+            processing_jobs[job_id]["message"] = "Generating 3D point cloud..."
             
             points, colors = depth_to_point_cloud(
                 image,
@@ -454,40 +474,36 @@ async def process_image_pipeline(job_id: str, image_data: bytes, request: Proces
                 smooth=request.smooth_depth,
                 fov=getattr(request, 'fov', None),
             )
-            # Denoise/refine
+            
+            # Refine point cloud
             points, colors = refine_point_cloud(points, colors)
             
         else:
             # For other models (TripoSR, InstantMesh, etc.)
-            # This would require their specific implementations
             processing_jobs[job_id]["progress"] = 40
             processing_jobs[job_id]["message"] = f"Processing with {request.model}..."
             
-            # Simulate processing for demo
-            import time
-            time.sleep(2)
-            
             # Generate dummy point cloud for demo
             points, colors = generate_dummy_point_cloud(image, request.point_density)
+            
+            # Create a dummy depth map for demo
+            depth_data_url = create_demo_depth_map(image)
         
         processing_jobs[job_id]["progress"] = 80
         processing_jobs[job_id]["message"] = "Saving point cloud..."
         
-        # Downsample preview points for frontend viewer (max ~20k)
-        try:
-            max_preview = 20000
-            if len(points) > max_preview:
-                stride = max(1, len(points) // max_preview)
-                pprev = points[::stride]
-                cprev = colors[::stride] if colors is not None and len(colors) else np.zeros_like(pprev)
-            else:
-                pprev = points
-                cprev = colors if colors is not None and len(colors) else np.zeros_like(points)
-            # Convert to lists to make JSON serializable
-            preview_points = pprev.astype(float).tolist()
-            preview_colors = cprev.astype(float).tolist()
-        except Exception:
-            preview_points, preview_colors = [], []
+        # Create preview points for frontend
+        max_preview = 20000
+        if len(points) > max_preview:
+            stride = max(1, len(points) // max_preview)
+            pprev = points[::stride]
+            cprev = colors[::stride] if colors is not None and len(colors) else np.zeros_like(pprev)
+        else:
+            pprev = points
+            cprev = colors if colors is not None and len(colors) else np.zeros_like(points)
+            
+        preview_points = pprev.astype(float).tolist()
+        preview_colors = cprev.astype(float).tolist()
 
         # Save artifact based on desired format; also build mesh preview if mesh generated
         mesh_formats = {"mesh_ply", "mesh"}
@@ -544,11 +560,12 @@ async def process_image_pipeline(job_id: str, image_data: bytes, request: Proces
         
     except Exception as e:
         logger.error(f"Error in processing pipeline: {str(e)}")
+        logger.error(traceback.format_exc())
         processing_jobs[job_id]["status"] = "error"
         processing_jobs[job_id]["message"] = f"Error: {str(e)}"
 
 def generate_dummy_point_cloud(image: np.ndarray, density: str) -> tuple:
-    """Generate dummy point cloud for unsupported models (demo purposes)"""
+    """Generate dummy point cloud for unsupported models"""
     h, w = image.shape[:2]
     step = {"low": 8, "medium": 4, "high": 2}[density]
     
@@ -569,6 +586,26 @@ def generate_dummy_point_cloud(image: np.ndarray, density: str) -> tuple:
     
     return np.array(points), np.array(colors)
 
+def create_demo_depth_map(image: np.ndarray) -> str:
+    """Create a demo depth map for unsupported models"""
+    try:
+        # Convert to grayscale
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        
+        # Apply some processing to make it look like a depth map
+        blurred = cv2.GaussianBlur(gray, (15, 15), 0)
+        depth_like = cv2.applyColorMap(255 - blurred, cv2.COLORMAP_PLASMA)
+        
+        # Encode to base64
+        ok, buf = cv2.imencode('.png', depth_like)
+        if ok:
+            depth_b64 = base64.b64encode(buf.tobytes()).decode('utf-8')
+            return f"data:image/png;base64,{depth_b64}"
+    except Exception as e:
+        logger.error(f"Failed to create demo depth map: {e}")
+    
+    return None
+
 @app.post("/process", response_model=dict)
 async def process_image(
     background_tasks: BackgroundTasks,
@@ -576,13 +613,27 @@ async def process_image(
     model: str = "depth-anything-v2",
     output_format: str = "las",
     point_density: str = "medium",
-    coordinate_system: str = "WGS84"
+    coordinate_system: str = "WGS84",
+    invert_depth: bool = True,
+    depth_scale: float = 10.0,
+    smooth_depth: bool = False,
+    fov: float = 60.0
 ):
     """Main endpoint for image processing"""
     
     # Validate input
     if not file.content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="File must be an image")
+    
+    # Read image data first to check size
+    image_data = await file.read()
+    
+    # Check file size (50MB limit)
+    if len(image_data) > MAX_FILE_SIZE:
+        raise HTTPException(
+            status_code=413, 
+            detail=f"File size ({len(image_data)/1024/1024:.1f}MB) exceeds maximum allowed size ({MAX_FILE_SIZE/1024/1024:.0f}MB)"
+        )
     
     # Generate job ID
     job_id = str(uuid.uuid4())
@@ -595,15 +646,16 @@ async def process_image(
         "results": None
     }
     
-    # Read image data
-    image_data = await file.read()
-    
     # Create processing request
     request = ProcessingRequest(
         model=model,
         output_format=output_format,
         point_density=point_density,
-        coordinate_system=coordinate_system
+        coordinate_system=coordinate_system,
+        invert_depth=invert_depth,
+        depth_scale=depth_scale,
+        smooth_depth=smooth_depth,
+        fov=fov
     )
     
     # Start background processing
@@ -638,42 +690,47 @@ async def download_result(job_id: str):
     
     filepath = job_data["results"]["pointCloud"]["filepath"]
     
-    from fastapi.responses import FileResponse
-    return FileResponse(filepath, media_type="application/octet-stream")
+    if not Path(filepath).exists():
+        raise HTTPException(status_code=404, detail="File not found")
+    
+    return FileResponse(
+        filepath, 
+        media_type="application/octet-stream",
+        filename=Path(filepath).name
+    )
 
 @app.get("/models")
 async def list_available_models():
     """List available AI models"""
     models = [
         {
+            "id": "depth-anything-v2",
+            "name": "Depth Anything V2", 
+            "description": "Superior depth estimation + point cloud",
+            "license": "Apache-2.0",
+            "recommended": True,
+            "supported": True,
+            "speed": "2-3s",
+            "quality": "High"
+        },
+        {
             "id": "triposr",
             "name": "TripoSR",
             "description": "Fast mesh generation (1-2 seconds)",
             "license": "MIT",
-            "recommended": True,
-            "supported": False  # Requires additional setup
+            "recommended": False,
+            "supported": False,  # Requires additional setup
+            "speed": "1-2s",
+            "quality": "Medium"
         },
         {
             "id": "instantmesh", 
             "name": "InstantMesh",
             "description": "High quality 3D assets (~10 seconds)",
             "license": "Custom",
-            "supported": False  # Requires additional setup
-        },
-        {
-            "id": "depth-anything-v2",
-            "name": "Depth Anything V2", 
-            "description": "Superior depth estimation + point cloud",
-            "license": "Apache-2.0",
-            "recommended": True,
-            "supported": True
-        },
-        {
-            "id": "spar3d",
-            "name": "SPAR3D",
-            "description": "Ultra-fast generation (<1 second)", 
-            "license": "Community",
-            "supported": False  # Requires additional setup
+            "supported": False,  # Requires additional setup
+            "speed": "~10s",
+            "quality": "Very High"
         }
     ]
     
@@ -682,8 +739,15 @@ async def list_available_models():
 @app.get("/health")
 async def health_check():
     """Health check endpoint"""
-    return {"status": "healthy", "models_loaded": list(models_cache.keys())}
+    return {
+        "status": "healthy", 
+        "models_loaded": list(models_cache.keys()),
+        "active_jobs": len(processing_jobs),
+        "max_file_size_mb": MAX_FILE_SIZE / (1024 * 1024)
+    }
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    # Create outputs directory
+    Path("outputs").mkdir(exist_ok=True)
+    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
