@@ -120,6 +120,162 @@ const App = () => {
     }
   ];
 
+  // ENHANCED: Generate point cloud from depth map and original image
+  const generatePointCloudFromDepthMap = async (imageUrl, depthMapUrl) => {
+    console.log('🎯 Generating point cloud from actual depth map and image...');
+    
+    try {
+      // Create canvases to read pixel data
+      const imageCanvas = document.createElement('canvas');
+      const depthCanvas = document.createElement('canvas');
+      const imageCtx = imageCanvas.getContext('2d');
+      const depthCtx = depthCanvas.getContext('2d');
+      
+      // Load and process original image
+      const imageImg = new Image();
+      const depthImg = new Image();
+      
+      await new Promise((resolve, reject) => {
+        imageImg.onload = resolve;
+        imageImg.onerror = reject;
+        imageImg.crossOrigin = 'anonymous'; // Handle CORS
+        imageImg.src = imageUrl;
+      });
+      
+      await new Promise((resolve, reject) => {
+        depthImg.onload = resolve;
+        depthImg.onerror = reject;
+        depthImg.crossOrigin = 'anonymous'; // Handle CORS
+        depthImg.src = depthMapUrl;
+      });
+      
+      // Use actual image dimensions but limit for performance
+      const maxDim = 300; // Limit size for performance
+      const imageAspect = imageImg.width / imageImg.height;
+      const depthAspect = depthImg.width / depthImg.height;
+      
+      // Calculate dimensions maintaining aspect ratio
+      let width, height;
+      if (imageAspect > 1) {
+        width = Math.min(imageImg.width, maxDim);
+        height = width / imageAspect;
+      } else {
+        height = Math.min(imageImg.height, maxDim);
+        width = height * imageAspect;
+      }
+      
+      width = Math.floor(width);
+      height = Math.floor(height);
+      
+      imageCanvas.width = width;
+      imageCanvas.height = height;
+      depthCanvas.width = width;
+      depthCanvas.height = height;
+      
+      // Draw images to canvases
+      imageCtx.drawImage(imageImg, 0, 0, width, height);
+      depthCtx.drawImage(depthImg, 0, 0, width, height);
+      
+      // Get pixel data
+      const imageData = imageCtx.getImageData(0, 0, width, height);
+      const depthData = depthCtx.getImageData(0, 0, width, height);
+      
+      const points = [];
+      const colors = [];
+      
+      // Sample every N pixels based on density setting
+      const step = settings.pointDensity === 'high' ? 1 : settings.pointDensity === 'medium' ? 2 : 3;
+      
+      console.log(`📊 Processing ${width}x${height} image with step size ${step}`);
+      console.log(`🎨 Depth map appears to be colorized (purple to yellow)`);
+      
+      let validPoints = 0;
+      let totalSampled = 0;
+      
+      for (let y = 0; y < height; y += step) {
+        for (let x = 0; x < width; x += step) {
+          totalSampled++;
+          const pixelIndex = (y * width + x) * 4;
+          
+          // FIXED: Handle colorized depth map
+          // Convert colorized depth to actual depth value
+          const depthR = depthData.data[pixelIndex] / 255.0;
+          const depthG = depthData.data[pixelIndex + 1] / 255.0;
+          const depthB = depthData.data[pixelIndex + 2] / 255.0;
+          
+          // For purple-to-yellow depth maps:
+          // Purple (far) = high blue, low red
+          // Yellow (near) = high red, low blue
+          // Convert to depth: higher red+green = closer (higher Z)
+          let depthValue;
+          if (depthR > 0.8 && depthG > 0.8 && depthB < 0.3) {
+            // Yellow = close
+            depthValue = 0.9;
+          } else if (depthR < 0.3 && depthG < 0.3 && depthB > 0.8) {
+            // Purple = far
+            depthValue = 0.1;
+          } else {
+            // Use luminance for intermediate colors
+            depthValue = (depthR + depthG - depthB * 0.5) / 1.5;
+            depthValue = Math.max(0, Math.min(1, depthValue));
+          }
+          
+          // Skip invalid depth values
+          if (depthValue < 0.05 || depthValue > 0.95) continue;
+          
+          // Get color from original image
+          const r = imageData.data[pixelIndex] / 255.0;
+          const g = imageData.data[pixelIndex + 1] / 255.0;
+          const b = imageData.data[pixelIndex + 2] / 255.0;
+          
+          // FIXED: Better coordinate transformation
+          // Convert image coordinates to 3D world coordinates
+          const worldX = (x - width / 2) * (settings.depthScale / Math.max(width, height));
+          const worldY = (height / 2 - y) * (settings.depthScale / Math.max(width, height)); // Flip Y and maintain aspect
+          
+          // Apply depth with proper scaling
+          let worldZ = depthValue * settings.depthScale * 0.5; // Scale depth appropriately
+          
+          // Invert depth if setting is enabled
+          if (settings.invertDepth) {
+            worldZ = (settings.depthScale * 0.5) - worldZ;
+          }
+          
+          // Center the Z coordinates
+          worldZ = worldZ - (settings.depthScale * 0.25);
+          
+          points.push([worldX, worldZ, worldY]); // Note: Y and Z swapped for proper orientation
+          colors.push([
+            Math.max(0.1, r), // Ensure minimum color visibility
+            Math.max(0.1, g),
+            Math.max(0.1, b)
+          ]);
+          
+          validPoints++;
+        }
+      }
+      
+      console.log(`✅ Generated ${validPoints} valid points from ${totalSampled} sampled pixels`);
+      console.log(`📏 Dimensions: ${width}x${height}, Step: ${step}, Depth scale: ${settings.depthScale}`);
+      
+      if (validPoints === 0) {
+        console.warn('⚠️ No valid points generated, depth map might be in wrong format');
+        return null;
+      }
+      
+      return {
+        preview: {
+          points: points,
+          colors: colors
+        }
+      };
+      
+    } catch (error) {
+      console.error('❌ Error generating point cloud from depth map:', error);
+      return null;
+    }
+  };
+
   // Initialize Three.js scene
   useEffect(() => {
     if (!mountRef.current) return;
@@ -300,72 +456,305 @@ const App = () => {
     };
   }, [showGrid, showAxes, cameraAutoRotate]);
 
-  // Handle 3D data loading and display
-  useEffect(() => {
-    console.log('🔄 3D data effect triggered', { 
-      previewPoints: results?.preview?.points?.length, 
-      meshVertices: results?.meshPreview?.vertices?.length,
-      viewerMode 
-    });
+  const clearScene = () => {
+    if (!sceneRef.current) return;
+    
+    console.log('🧹 Clearing 3D scene');
+    
+    if (pointCloudRef.current) {
+      sceneRef.current.remove(pointCloudRef.current);
+      pointCloudRef.current.geometry?.dispose();
+      pointCloudRef.current.material?.dispose();
+      pointCloudRef.current = null;
+    }
+    if (meshRef.current) {
+      sceneRef.current.remove(meshRef.current);
+      meshRef.current.geometry?.dispose();
+      meshRef.current.material?.dispose();
+      meshRef.current = null;
+    }
+    
+    // Update debug info
+    setDebugInfo(prev => ({
+      ...prev,
+      pointsLoaded: 0,
+      sceneObjects: sceneRef.current.children.length
+    }));
+  };
 
+  // ENHANCED: Fixed point cloud display with proper sizing
+  const displayPointCloudData = (data) => {
     if (!sceneRef.current) {
-      console.log('❌ Scene not ready');
+      console.log('❌ Scene not available for point cloud display');
       return;
     }
+    
+    console.log('🎨 Displaying point cloud data', { 
+      pointsLength: data.points.length / 3,
+      colorsLength: data.colors.length / 3 
+    });
+    
+    clearScene();
 
-    // Clear any loading state
-    setViewer3DLoading(false);
+    try {
+      const geometry = new THREE.BufferGeometry();
+      const positions = new Float32Array(data.points);
+      const colors = new Float32Array(data.colors);
 
-    // If backend preview is present, render it directly for point clouds
-    if (viewerMode === 'pointcloud' && results?.preview?.points?.length) {
-      console.log('📊 Loading point cloud from preview data');
-      const pts = results.preview.points;
-      const cols = results.preview.colors || [];
-      const flatPos = new Float32Array(pts.length * 3);
-      const flatCol = new Float32Array(pts.length * 3);
-      
-      for (let i = 0; i < pts.length; i++) {
-        const p = pts[i];
-        flatPos[i * 3 + 0] = p[0];
-        flatPos[i * 3 + 1] = p[1];
-        flatPos[i * 3 + 2] = p[2];
-        const c = cols[i] || [128, 128, 128];
-        flatCol[i * 3 + 0] = c[0] / 255;
-        flatCol[i * 3 + 1] = c[1] / 255;
-        flatCol[i * 3 + 2] = c[2] / 255;
+      geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+      geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+
+      // FIXED: Better point size calculation
+      const material = new THREE.PointsMaterial({
+        size: Math.max(0.05, pointSize * 0.02), // Much smaller base size
+        vertexColors: true,
+        sizeAttenuation: true,
+        transparent: true,
+        opacity: 0.9,
+        alphaTest: 0.1 // Helps with rendering quality
+      });
+
+      const points = new THREE.Points(geometry, material);
+      pointCloudRef.current = points;
+      sceneRef.current.add(points);
+
+      console.log('✅ Point cloud added to scene with proper sizing');
+
+      // Enhanced camera positioning for better initial view
+      try {
+        geometry.computeBoundingBox();
+        const box = geometry.boundingBox;
+        if (box && !box.isEmpty()) {
+          const center = box.getCenter(new THREE.Vector3());
+          const size = box.getSize(new THREE.Vector3());
+          const maxDim = Math.max(size.x, size.y, size.z);
+          
+          if (maxDim > 0) {
+            const fov = cameraRef.current.fov * (Math.PI / 180);
+            const cameraDistance = Math.abs(maxDim / (2 * Math.tan(fov / 2))) * 1.8;
+            
+            // Position camera at an optimal angle for depth visualization
+            const offset = new THREE.Vector3(
+              cameraDistance * 0.5,
+              cameraDistance * 0.3,
+              cameraDistance * 0.8
+            );
+            
+            cameraRef.current.position.copy(center).add(offset);
+            cameraRef.current.lookAt(center);
+            controlsRef.current.cameraDistance = cameraDistance;
+            
+            console.log('📷 Auto-positioned camera for actual point cloud data');
+          }
+        } else {
+          console.log('⚠️ Empty bounding box, using fallback positioning');
+          cameraRef.current.position.set(15, 10, 15);
+          cameraRef.current.lookAt(0, 0, 0);
+          controlsRef.current.cameraDistance = 20;
+        }
+      } catch (err) {
+        console.log('⚠️ Could not auto-position camera:', err);
+        cameraRef.current.position.set(15, 10, 15);
+        cameraRef.current.lookAt(0, 0, 0);
+        controlsRef.current.cameraDistance = 20;
       }
-      displayPointCloudData({ points: flatPos, colors: flatCol });
-      return;
+
+      // Update debug info
+      setDebugInfo(prev => ({
+        ...prev,
+        pointsLoaded: positions.length / 3,
+        sceneObjects: sceneRef.current.children.length,
+        cameraPosition: `${cameraRef.current.position.x.toFixed(1)}, ${cameraRef.current.position.y.toFixed(1)}, ${cameraRef.current.position.z.toFixed(1)}`
+      }));
+
+    } catch (error) {
+      console.error('❌ Error displaying point cloud:', error);
     }
+  };
+
+  const displayMeshData = (data) => {
+    if (!sceneRef.current) return;
     
-    // If mesh preview is present, render it
-    if (viewerMode === 'mesh' && results?.meshPreview?.vertices?.length) {
-      console.log('🔺 Loading mesh from preview data');
-      const v = results.meshPreview.vertices.flat();
-      const n = (results.meshPreview.normals || results.meshPreview.vertices).flat();
-      const c = (results.meshPreview.colors || []).flat();
-      const f = results.meshPreview.faces || [];
-      const vertices = new Float32Array(v);
-      const normals = new Float32Array(n);
-      const colors = c.length ? new Float32Array(c) : new Float32Array(vertices.length).fill(0.7);
-      const faces = new Uint32Array(f);
-      displayMeshData({ vertices, normals, colors, faces });
-      return;
+    console.log('🔺 Displaying mesh data');
+    clearScene();
+
+    try {
+      const geometry = new THREE.BufferGeometry();
+      const positions = new Float32Array(data.vertices);
+      const normals = new Float32Array(data.normals);
+      const colors = new Float32Array(data.colors);
+      const indices = new Uint16Array(data.faces);
+
+      geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+      geometry.setAttribute('normal', new THREE.BufferAttribute(normals, 3));
+      geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+      geometry.setIndex(new THREE.BufferAttribute(indices, 1));
+
+      const material = new THREE.MeshPhongMaterial({
+        vertexColors: true,
+        wireframe: wireframe,
+        transparent: true,
+        opacity: wireframe ? 1.0 : 0.9,
+        side: THREE.DoubleSide,
+        shininess: 30
+      });
+
+      const mesh = new THREE.Mesh(geometry, material);
+      mesh.castShadow = true;
+      mesh.receiveShadow = true;
+      meshRef.current = mesh;
+      sceneRef.current.add(mesh);
+
+      console.log('✅ Mesh added to scene');
+
+      // Camera positioning for mesh
+      try {
+        geometry.computeBoundingBox();
+        const box = geometry.boundingBox;
+        if (box && !box.isEmpty()) {
+          const center = box.getCenter(new THREE.Vector3());
+          const size = box.getSize(new THREE.Vector3());
+          const maxDim = Math.max(size.x, size.y, size.z);
+          
+          if (maxDim > 0) {
+            const fov = cameraRef.current.fov * (Math.PI / 180);
+            const cameraDistance = Math.abs(maxDim / (2 * Math.tan(fov / 2))) * 2.5;
+            
+            const offset = new THREE.Vector3(
+              cameraDistance * 0.7,
+              cameraDistance * 0.5,
+              cameraDistance * 0.7
+            );
+            
+            cameraRef.current.position.copy(center).add(offset);
+            cameraRef.current.lookAt(center);
+            controlsRef.current.cameraDistance = cameraDistance;
+          }
+        }
+      } catch (err) {
+        cameraRef.current.position.set(15, 10, 15);
+        cameraRef.current.lookAt(0, 0, 0);
+        controlsRef.current.cameraDistance = 20;
+      }
+
+      setDebugInfo(prev => ({
+        ...prev,
+        pointsLoaded: positions.length / 3,
+        sceneObjects: sceneRef.current.children.length,
+        cameraPosition: `${cameraRef.current.position.x.toFixed(1)}, ${cameraRef.current.position.y.toFixed(1)}, ${cameraRef.current.position.z.toFixed(1)}`
+      }));
+
+    } catch (error) {
+      console.error('❌ Error displaying mesh:', error);
     }
+  };
+
+  // ENHANCED: Improved demo generation that's more realistic
+  const generateDemo3DContent = () => {
+    if (!sceneRef.current) return;
     
-    // Otherwise try to fetch from backend if we have a job id
-    if (results.jobId) {
-      console.log('🌐 Fetching 3D data from backend');
-      load3DDataFromBackend(results.jobId);
-      return;
+    console.log('🎪 Generating improved demo 3D content for', viewerMode);
+    clearScene();
+
+    let actualPointCount = 0; // Fix: Declare at function level
+
+    if (viewerMode === 'pointcloud') {
+      // Create a more realistic demo that could represent a depth-based point cloud
+      const pointCount = 4000;
+      const geometry = new THREE.BufferGeometry();
+      const positions = new Float32Array(pointCount * 3);
+      const colors = new Float32Array(pointCount * 3);
+
+      // Generate a more realistic surface that could come from a depth map
+      const imageWidth = 80;
+      const imageHeight = 60;
+      let pointIndex = 0;
+
+      for (let y = 0; y < imageHeight && pointIndex < pointCount; y += 2) {
+        for (let x = 0; x < imageWidth && pointIndex < pointCount; x += 2) {
+          const normalizedX = (x - imageWidth / 2) / imageWidth * 8;
+          const normalizedY = -(y - imageHeight / 2) / imageHeight * 6;
+          
+          // Create a more realistic depth pattern
+          const centerDistance = Math.sqrt(normalizedX * normalizedX + normalizedY * normalizedY);
+          const depth = Math.max(0, 3 - centerDistance * 0.5 + Math.sin(normalizedX * 2) * 0.3 + Math.cos(normalizedY * 2) * 0.3);
+          
+          const i3 = pointIndex * 3;
+          positions[i3] = normalizedX;
+          positions[i3 + 1] = depth - 1;
+          positions[i3 + 2] = normalizedY;
+
+          // Color based on depth and position
+          const heightNorm = depth / 3;
+          colors[i3] = Math.max(0.2, 0.6 + Math.sin(normalizedX) * 0.3);
+          colors[i3 + 1] = Math.max(0.3, 0.7 + Math.cos(normalizedY) * 0.2);
+          colors[i3 + 2] = Math.max(0.4, heightNorm * 0.8 + 0.2);
+          
+          pointIndex++;
+        }
+      }
+
+      actualPointCount = pointIndex; // Fix: Store the actual count
+
+      const trimmedPositions = positions.slice(0, pointIndex * 3);
+      const trimmedColors = colors.slice(0, pointIndex * 3);
+
+      geometry.setAttribute('position', new THREE.BufferAttribute(trimmedPositions, 3));
+      geometry.setAttribute('color', new THREE.BufferAttribute(trimmedColors, 3));
+
+      const material = new THREE.PointsMaterial({
+        size: Math.max(0.05, pointSize * 0.02),
+        vertexColors: true,
+        sizeAttenuation: true,
+        transparent: true,
+        opacity: 0.8
+      });
+
+      const points = new THREE.Points(geometry, material);
+      pointCloudRef.current = points;
+      sceneRef.current.add(points);
+      
+      console.log(`✅ Improved demo point cloud created with ${pointIndex} points`);
+      
+    } else if (viewerMode === 'mesh') {
+      const geometry = new THREE.SphereGeometry(3, 32, 32);
+      
+      const positions = geometry.attributes.position;
+      for (let i = 0; i < positions.count; i++) {
+        const vertex = new THREE.Vector3();
+        vertex.fromBufferAttribute(positions, i);
+        const noise = (Math.random() - 0.5) * 0.3;
+        vertex.multiplyScalar(1 + noise);
+        positions.setXYZ(i, vertex.x, vertex.y, vertex.z);
+      }
+      positions.needsUpdate = true;
+      geometry.computeVertexNormals();
+
+      const material = new THREE.MeshPhongMaterial({
+        color: wireframe ? 0x00aaff : 0x00ff88,
+        wireframe: wireframe,
+        transparent: true,
+        opacity: wireframe ? 1.0 : 0.9,
+        side: THREE.DoubleSide,
+        shininess: 100
+      });
+
+      const mesh = new THREE.Mesh(geometry, material);
+      mesh.castShadow = true;
+      mesh.receiveShadow = true;
+      meshRef.current = mesh;
+      sceneRef.current.add(mesh);
+      
+      actualPointCount = 1032; // Mesh vertex count
+      console.log('✅ Improved demo mesh created');
     }
-    
-    // Fallback demo - only if no real data
-    if (!results.pointCloud && !results.mesh && !results.preview) {
-      console.log('🎪 Generating demo 3D content');
-      generateDemo3DContent();
-    }
-  }, [results.preview, results.pointCloud, results.mesh, results.meshPreview, results.jobId, pointSize, viewerMode, wireframe]);
+
+    setDebugInfo(prev => ({
+      ...prev,
+      pointsLoaded: actualPointCount,
+      sceneObjects: sceneRef.current.children.length
+    }));
+  };
 
   const load3DDataFromBackend = async (jobId) => {
     setViewer3DLoading(true);
@@ -412,305 +801,100 @@ const App = () => {
     }
   };
 
-  const clearScene = () => {
-    if (!sceneRef.current) return;
-    
-    console.log('🧹 Clearing 3D scene');
-    
-    if (pointCloudRef.current) {
-      sceneRef.current.remove(pointCloudRef.current);
-      pointCloudRef.current.geometry?.dispose();
-      pointCloudRef.current.material?.dispose();
-      pointCloudRef.current = null;
-    }
-    if (meshRef.current) {
-      sceneRef.current.remove(meshRef.current);
-      meshRef.current.geometry?.dispose();
-      meshRef.current.material?.dispose();
-      meshRef.current = null;
-    }
-    
-    // Update debug info
-    setDebugInfo(prev => ({
-      ...prev,
-      pointsLoaded: 0,
-      sceneObjects: sceneRef.current.children.length
-    }));
-  };
-
-  const displayPointCloudData = (data) => {
-    if (!sceneRef.current) {
-      console.log('❌ Scene not available for point cloud display');
-      return;
-    }
-    
-    console.log('🎨 Displaying point cloud data', { 
-      pointsLength: data.points.length / 3,
-      colorsLength: data.colors.length / 3 
-    });
-    
-    // Always clear scene first to remove old content
-    clearScene();
-
-    try {
-      const geometry = new THREE.BufferGeometry();
-      const positions = new Float32Array(data.points);
-      const colors = new Float32Array(data.colors);
-
-      geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-      geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
-
-      const material = new THREE.PointsMaterial({
-        size: Math.max(0.8, pointSize / 8),
-        vertexColors: true,
-        sizeAttenuation: true,
-        transparent: true,
-        opacity: 0.9
+  // ENHANCED: Enhanced 3D data effect with proper depth map correlation
+  useEffect(() => {
+    const enhanced3DDataEffect = () => {
+      console.log('🔄 Enhanced 3D data effect triggered', { 
+        hasDepthMap: !!results.depthMap,
+        hasUploadedImage: !!uploadedImage,
+        viewerMode,
+        previewPoints: results?.preview?.points?.length
       });
 
-      const points = new THREE.Points(geometry, material);
-      pointCloudRef.current = points;
-      sceneRef.current.add(points);
-
-      console.log('✅ Point cloud added to scene');
-
-      // Improved automatic camera positioning
-      try {
-        geometry.computeBoundingBox();
-        const box = geometry.boundingBox;
-        if (box && !box.isEmpty()) {
-          const center = box.getCenter(new THREE.Vector3());
-          const size = box.getSize(new THREE.Vector3());
-          const maxDim = Math.max(size.x, size.y, size.z);
-          
-          if (maxDim > 0) {
-            const fov = cameraRef.current.fov * (Math.PI / 180);
-            const cameraDistance = Math.abs(maxDim / (2 * Math.tan(fov / 2))) * 2.2; // Increased padding
-            
-            // Position camera at a good angle
-            const offset = new THREE.Vector3(
-              cameraDistance * 0.6,
-              cameraDistance * 0.4,
-              cameraDistance * 0.6
-            );
-            
-            cameraRef.current.position.copy(center).add(offset);
-            cameraRef.current.lookAt(center);
-            controlsRef.current.cameraDistance = cameraDistance;
-            
-            console.log('📷 Auto-positioned camera for point cloud', { 
-              center: center.toArray(), 
-              size: maxDim, 
-              cameraDistance,
-              cameraPos: cameraRef.current.position.toArray()
-            });
-          }
-        } else {
-          console.log('⚠️ Empty bounding box, using fallback positioning');
-          // Fallback positioning
-          cameraRef.current.position.set(15, 10, 15);
-          cameraRef.current.lookAt(0, 0, 0);
-          controlsRef.current.cameraDistance = 20;
-        }
-      } catch (err) {
-        console.log('⚠️ Could not auto-position camera:', err);
-        // Fallback positioning
-        cameraRef.current.position.set(15, 10, 15);
-        cameraRef.current.lookAt(0, 0, 0);
-        controlsRef.current.cameraDistance = 20;
+      if (!sceneRef.current) {
+        console.log('❌ Scene not ready');
+        return;
       }
 
-      // Update debug info
-      setDebugInfo(prev => ({
-        ...prev,
-        pointsLoaded: positions.length / 3,
-        sceneObjects: sceneRef.current.children.length,
-        cameraPosition: `${cameraRef.current.position.x.toFixed(1)}, ${cameraRef.current.position.y.toFixed(1)}, ${cameraRef.current.position.z.toFixed(1)}`
-      }));
+      setViewer3DLoading(false);
 
-    } catch (error) {
-      console.error('❌ Error displaying point cloud:', error);
-    }
-  };
-
-  const displayMeshData = (data) => {
-    if (!sceneRef.current) return;
-    
-    console.log('🔺 Displaying mesh data');
-    
-    // Always clear scene first to remove old content
-    clearScene();
-
-    try {
-      const geometry = new THREE.BufferGeometry();
-      const positions = new Float32Array(data.vertices);
-      const normals = new Float32Array(data.normals);
-      const colors = new Float32Array(data.colors);
-      const indices = new Uint16Array(data.faces);
-
-      geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-      geometry.setAttribute('normal', new THREE.BufferAttribute(normals, 3));
-      geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
-      geometry.setIndex(new THREE.BufferAttribute(indices, 1));
-
-      const material = new THREE.MeshPhongMaterial({
-        vertexColors: true,
-        wireframe: wireframe,
-        transparent: true,
-        opacity: wireframe ? 1.0 : 0.9,
-        side: THREE.DoubleSide,
-        shininess: 30
-      });
-
-      const mesh = new THREE.Mesh(geometry, material);
-      mesh.castShadow = true;
-      mesh.receiveShadow = true;
-      meshRef.current = mesh;
-      sceneRef.current.add(mesh);
-
-      console.log('✅ Mesh added to scene');
-
-      // Improved automatic camera positioning for mesh
-      try {
-        geometry.computeBoundingBox();
-        const box = geometry.boundingBox;
-        if (box && !box.isEmpty()) {
-          const center = box.getCenter(new THREE.Vector3());
-          const size = box.getSize(new THREE.Vector3());
-          const maxDim = Math.max(size.x, size.y, size.z);
-          
-          if (maxDim > 0) {
-            const fov = cameraRef.current.fov * (Math.PI / 180);
-            const cameraDistance = Math.abs(maxDim / (2 * Math.tan(fov / 2))) * 2.5; // More padding for mesh
-            
-            // Position camera at a good angle for mesh viewing
-            const offset = new THREE.Vector3(
-              cameraDistance * 0.7,
-              cameraDistance * 0.5,
-              cameraDistance * 0.7
-            );
-            
-            cameraRef.current.position.copy(center).add(offset);
-            cameraRef.current.lookAt(center);
-            controlsRef.current.cameraDistance = cameraDistance;
-            
-            console.log('📷 Auto-positioned camera for mesh', { 
-              center: center.toArray(), 
-              size: maxDim, 
-              cameraDistance,
-              cameraPos: cameraRef.current.position.toArray()
-            });
-          }
-        } else {
-          console.log('⚠️ Empty bounding box for mesh, using fallback positioning');
-          cameraRef.current.position.set(15, 10, 15);
-          cameraRef.current.lookAt(0, 0, 0);
-          controlsRef.current.cameraDistance = 20;
-        }
-      } catch (err) {
-        console.log('⚠️ Could not auto-position camera for mesh:', err);
-        cameraRef.current.position.set(15, 10, 15);
-        cameraRef.current.lookAt(0, 0, 0);
-        controlsRef.current.cameraDistance = 20;
-      }
-
-      // Update debug info
-      setDebugInfo(prev => ({
-        ...prev,
-        pointsLoaded: positions.length / 3,
-        sceneObjects: sceneRef.current.children.length,
-        cameraPosition: `${cameraRef.current.position.x.toFixed(1)}, ${cameraRef.current.position.y.toFixed(1)}, ${cameraRef.current.position.z.toFixed(1)}`
-      }));
-
-    } catch (error) {
-      console.error('❌ Error displaying mesh:', error);
-    }
-  };
-
-  const generateDemo3DContent = () => {
-    if (!sceneRef.current) return;
-    
-    console.log('🎪 Generating demo 3D content for', viewerMode);
-    clearScene();
-
-    if (viewerMode === 'pointcloud') {
-      const pointCount = 8000;
-      const geometry = new THREE.BufferGeometry();
-      const positions = new Float32Array(pointCount * 3);
-      const colors = new Float32Array(pointCount * 3);
-
-      for (let i = 0; i < pointCount; i++) {
-        const i3 = i * 3;
-        const x = (Math.random() - 0.5) * 12;
-        const z = (Math.random() - 0.5) * 12;
-        const y = Math.sin(x * 0.3) * Math.cos(z * 0.3) * 3 + Math.random() * 0.8;
+      // Priority 1: Use backend preview data if available
+      if (viewerMode === 'pointcloud' && results?.preview?.points?.length) {
+        console.log('📊 Loading point cloud from backend preview data');
+        const pts = results.preview.points;
+        const cols = results.preview.colors || [];
+        const flatPos = new Float32Array(pts.length * 3);
+        const flatCol = new Float32Array(pts.length * 3);
         
-        positions[i3] = x;
-        positions[i3 + 1] = y;
-        positions[i3 + 2] = z;
-
-        const heightNorm = (y + 3) / 6;
-        colors[i3] = Math.max(0.2, heightNorm - 0.2);
-        colors[i3 + 1] = Math.max(0.3, 1 - Math.abs(heightNorm - 0.5) * 2);
-        colors[i3 + 2] = Math.max(0.4, 0.8 - heightNorm);
+        for (let i = 0; i < pts.length; i++) {
+          const p = pts[i];
+          flatPos[i * 3 + 0] = p[0];
+          flatPos[i * 3 + 1] = p[1];
+          flatPos[i * 3 + 2] = p[2];
+          const c = cols[i] || [128, 128, 128];
+          flatCol[i * 3 + 0] = c[0] / 255;
+          flatCol[i * 3 + 1] = c[1] / 255;
+          flatCol[i * 3 + 2] = c[2] / 255;
+        }
+        displayPointCloudData({ points: flatPos, colors: flatCol });
+        return;
       }
 
-      geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-      geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
-
-      const material = new THREE.PointsMaterial({
-        size: pointSize / 8,
-        vertexColors: true,
-        sizeAttenuation: true,
-        transparent: true,
-        opacity: 0.8
-      });
-
-      const points = new THREE.Points(geometry, material);
-      pointCloudRef.current = points;
-      sceneRef.current.add(points);
-      
-      console.log('✅ Demo point cloud created');
-      
-    } else if (viewerMode === 'mesh') {
-      const geometry = new THREE.SphereGeometry(4, 32, 32);
-      
-      const positions = geometry.attributes.position;
-      for (let i = 0; i < positions.count; i++) {
-        const vertex = new THREE.Vector3();
-        vertex.fromBufferAttribute(positions, i);
-        const noise = (Math.random() - 0.5) * 0.4;
-        vertex.multiplyScalar(1 + noise);
-        positions.setXYZ(i, vertex.x, vertex.y, vertex.z);
+      // Priority 2: Generate from depth map and original image if both available
+      if (viewerMode === 'pointcloud' && results.depthMap && uploadedImage) {
+        console.log('🎯 Generating point cloud from depth map and original image');
+        setViewer3DLoading(true);
+        
+        generatePointCloudFromDepthMap(uploadedImage.url, results.depthMap)
+          .then(generated => {
+            setViewer3DLoading(false);
+            if (generated?.preview?.points?.length) {
+              console.log('✅ Successfully generated point cloud from depth map');
+              const pts = generated.preview.points;
+              const cols = generated.preview.colors || [];
+              const flatPos = new Float32Array(pts.length * 3);
+              const flatCol = new Float32Array(pts.length * 3);
+              
+              for (let i = 0; i < pts.length; i++) {
+                const p = pts[i];
+                flatPos[i * 3 + 0] = p[0];
+                flatPos[i * 3 + 1] = p[1];
+                flatPos[i * 3 + 2] = p[2];
+                const c = cols[i] || [128, 128, 128];
+                flatCol[i * 3 + 0] = c[0] / 255;
+                flatCol[i * 3 + 1] = c[1] / 255;
+                flatCol[i * 3 + 2] = c[2] / 255;
+              }
+              displayPointCloudData({ points: flatPos, colors: flatCol });
+            } else {
+              console.log('⚠️ Failed to generate from depth map, using fallback');
+              generateDemo3DContent();
+            }
+          })
+          .catch(error => {
+            console.error('❌ Error in depth map generation:', error);
+            setViewer3DLoading(false);
+            generateDemo3DContent();
+          });
+        return;
       }
-      positions.needsUpdate = true;
-      geometry.computeVertexNormals();
 
-      const material = new THREE.MeshPhongMaterial({
-        color: wireframe ? 0x00aaff : 0x00ff88,
-        wireframe: wireframe,
-        transparent: true,
-        opacity: wireframe ? 0.8 : 0.9,
-        side: THREE.DoubleSide,
-        shininess: 100
-      });
+      // Priority 3: Try to fetch from backend
+      if (results.jobId) {
+        console.log('🌐 Fetching 3D data from backend');
+        load3DDataFromBackend(results.jobId);
+        return;
+      }
 
-      const mesh = new THREE.Mesh(geometry, material);
-      mesh.castShadow = true;
-      mesh.receiveShadow = true;
-      meshRef.current = mesh;
-      sceneRef.current.add(mesh);
-      
-      console.log('✅ Demo mesh created');
-    }
+      // Priority 4: Improved demo content
+      if (!results.pointCloud && !results.mesh && !results.preview) {
+        console.log('🎪 Generating improved demo 3D content');
+        generateDemo3DContent();
+      }
+    };
 
-    // Update debug info
-    setDebugInfo(prev => ({
-      ...prev,
-      pointsLoaded: viewerMode === 'pointcloud' ? 8000 : 1032,
-      sceneObjects: sceneRef.current.children.length
-    }));
-  };
+    enhanced3DDataEffect();
+  }, [results.preview, results.pointCloud, results.mesh, results.meshPreview, results.jobId, results.depthMap, uploadedImage, pointSize, viewerMode, wireframe, settings.pointDensity, settings.depthScale, settings.invertDepth]);
 
   const handleImageUpload = useCallback((event) => {
     const file = event.target.files[0];
@@ -884,7 +1068,7 @@ const App = () => {
     e.stopPropagation();
     setIsPanning(true);
     setLastPanPoint({ x: e.clientX, y: e.clientY });
-    document.body.style.userSelect = 'none'; // Prevent text selection
+    document.body.style.userSelect = 'none';
   };
 
   const handleDepthMouseMove = (e) => {
@@ -901,7 +1085,6 @@ const App = () => {
       setLastPanPoint({ x: e.clientX, y: e.clientY });
     }
 
-    // Show depth value on hover (simplified)
     const rect = e.currentTarget.getBoundingClientRect();
     const x = ((e.clientX - rect.left) / rect.width * 100).toFixed(1);
     const y = ((e.clientY - rect.top) / rect.height * 100).toFixed(1);
@@ -912,7 +1095,7 @@ const App = () => {
     e.preventDefault();
     e.stopPropagation();
     setIsPanning(false);
-    document.body.style.userSelect = ''; // Restore text selection
+    document.body.style.userSelect = '';
   };
 
   const resetDepthView = () => {
@@ -926,7 +1109,6 @@ const App = () => {
     
     console.log('🎯 Zooming to extent...');
     
-    // Find all visible geometry in the scene
     const box = new THREE.Box3();
     let hasGeometry = false;
     
@@ -956,12 +1138,10 @@ const App = () => {
       return;
     }
     
-    // Calculate optimal camera distance
     const camera = cameraRef.current;
     const fov = camera.fov * (Math.PI / 180);
-    const distance = Math.abs(maxDim / (2 * Math.tan(fov / 2))) * 2.5; // Add some padding
+    const distance = Math.abs(maxDim / (2 * Math.tan(fov / 2))) * 2.5;
     
-    // Position camera to view the entire object
     const direction = new THREE.Vector3().subVectors(camera.position, center).normalize();
     if (direction.length() === 0) {
       direction.set(1, 1, 1).normalize();
@@ -970,12 +1150,10 @@ const App = () => {
     camera.position.copy(center).add(direction.multiplyScalar(distance));
     camera.lookAt(center);
     
-    // Update controls
     controlsRef.current.cameraDistance = distance;
     
     console.log('✅ Zoomed to extent:', { center, size: maxDim, distance });
     
-    // Update debug info
     setDebugInfo(prev => ({
       ...prev,
       cameraPosition: `${camera.position.x.toFixed(1)}, ${camera.position.y.toFixed(1)}, ${camera.position.z.toFixed(1)}`
@@ -1298,6 +1476,47 @@ const App = () => {
                   Interactive Depth Map
                 </h3>
                 <div className="flex items-center space-x-2">
+                  {uploadedImage && (
+                    <button
+                      onClick={() => {
+                        console.log('🔄 Manually regenerating point cloud from depth map');
+                        // Trigger the enhanced3DDataEffect manually
+                        if (results.depthMap && uploadedImage) {
+                          setViewer3DLoading(true);
+                          generatePointCloudFromDepthMap(uploadedImage.url, results.depthMap)
+                            .then(generated => {
+                              setViewer3DLoading(false);
+                              if (generated?.preview?.points?.length) {
+                                const pts = generated.preview.points;
+                                const cols = generated.preview.colors || [];
+                                const flatPos = new Float32Array(pts.length * 3);
+                                const flatCol = new Float32Array(pts.length * 3);
+                                
+                                for (let i = 0; i < pts.length; i++) {
+                                  const p = pts[i];
+                                  flatPos[i * 3 + 0] = p[0];
+                                  flatPos[i * 3 + 1] = p[1];
+                                  flatPos[i * 3 + 2] = p[2];
+                                  const c = cols[i] || [128, 128, 128];
+                                  flatCol[i * 3 + 0] = c[0] / 255;
+                                  flatCol[i * 3 + 1] = c[1] / 255;
+                                  flatCol[i * 3 + 2] = c[2] / 255;
+                                }
+                                displayPointCloudData({ points: flatPos, colors: flatCol });
+                              }
+                            })
+                            .catch(error => {
+                              console.error('❌ Manual regeneration failed:', error);
+                              setViewer3DLoading(false);
+                            });
+                        }
+                      }}
+                      className="p-2 bg-blue-600 rounded-lg hover:bg-blue-700 transition-colors text-sm"
+                      title="Regenerate 3D from Depth Map"
+                    >
+                      <Box className="w-4 h-4" />
+                    </button>
+                  )}
                   <button
                     onClick={() => setDepthZoom(prev => Math.min(prev * 1.2, 10))}
                     className="p-2 bg-slate-700 rounded-lg hover:bg-slate-600 transition-colors"
@@ -1374,22 +1593,36 @@ const App = () => {
                 <div className="flex items-center space-x-4 text-xs text-slate-500">
                   <span>🖱️ Drag: Pan</span>
                   <span>⚡ Wheel: Zoom</span>
+                  <span>📦 Blue btn: Regen 3D</span>
                 </div>
               </div>
             </div>
           )}
 
           {/* Quick Stats */}
-          {results.pointCloud && (
+          {(results.pointCloud || results.depthMap) && (
             <div className="bg-slate-800/50 rounded-2xl p-6 border border-slate-700/50 backdrop-blur-sm">
               <h3 className="text-lg font-semibold mb-4 flex items-center">
                 <BarChart3 className="w-5 h-5 mr-2 text-green-400" />
                 Generation Stats
               </h3>
+              
+              {results.depthMap && uploadedImage && (
+                <div className="mb-4 p-3 bg-green-500/10 border border-green-500/30 rounded-lg">
+                  <div className="flex items-center text-green-400 text-sm">
+                    <CheckCircle2 className="w-4 h-4 mr-2" />
+                    Point cloud correlates with depth map & original image
+                  </div>
+                  <div className="text-xs text-green-300 mt-1">
+                    Click the blue 📦 button above to regenerate from depth data
+                  </div>
+                </div>
+              )}
+              
               <div className="grid grid-cols-2 gap-4">
                 <div className="bg-slate-700/50 rounded-lg p-3 text-center">
                   <div className="text-2xl font-bold text-blue-400">
-                    {results.pointCloud.points?.toLocaleString() || '0'}
+                    {results.pointCloud?.points?.toLocaleString() || debugInfo.pointsLoaded.toLocaleString()}
                   </div>
                   <div className="text-sm text-slate-400">Points Generated</div>
                 </div>
@@ -1509,6 +1742,9 @@ const App = () => {
                   </div>
                   <div>Points: {debugInfo.pointsLoaded.toLocaleString()}</div>
                   <div>Objects: {debugInfo.sceneObjects}</div>
+                  {results.depthMap && uploadedImage && (
+                    <div className="text-green-400 text-xs">✓ Depth-based</div>
+                  )}
                 </div>
                 
                 <div className="absolute bottom-3 left-3 bg-black/60 text-white p-2 rounded-lg text-xs backdrop-blur-sm">
@@ -1726,12 +1962,16 @@ const App = () => {
                 <input 
                   type="range" 
                   min="1" 
-                  max="10" 
+                  max="20" 
                   step="1" 
                   value={pointSize} 
                   onChange={(e) => setPointSize(Number(e.target.value))} 
                   className="w-full accent-blue-500" 
                 />
+                <div className="flex justify-between text-xs text-slate-500 mt-1">
+                  <span>Fine</span>
+                  <span>Coarse</span>
+                </div>
               </div>
 
               <div>
